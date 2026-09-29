@@ -2,13 +2,15 @@
 -- 03_history_guard.sql
 --   Second trigger: protects a history table from direct data manipulation.
 --
---   Every INSERT / UPDATE / DELETE on the history table is rejected unless it
---   comes from temporal.versioning() / temporal.versioning_truncate(), which
---   announce themselves by setting the session variable temporal.history_write
---   to 'on' for the duration of their own statements only (is_local => true).
+--   The history is immutable: it only grows.
 --
---   TRUNCATE of a history table is rejected unconditionally: nothing in this
---   library ever truncates history.
+--   An INSERT into the history table is rejected unless it comes from
+--   temporal.versioning() / temporal.versioning_truncate(), which announce
+--   themselves by setting the session variable temporal.history_write to 'on'
+--   for the duration of their own statements only (is_local => true).
+--
+--   UPDATE, DELETE and TRUNCATE of a history table are rejected
+--   unconditionally: nothing in this library ever changes or removes history.
 --
 --   Attach with (see 04_api.sql, which does this for you):
 --
@@ -39,18 +41,15 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $function$
 BEGIN
-    IF current_setting(temporal.write_flag_name(), true) = 'on' THEN
+    IF TG_OP = 'INSERT' AND current_setting(temporal.write_flag_name(), true) = 'on' THEN
         -- Written by the versioning trigger: allow it through unchanged.
-        IF TG_OP = 'DELETE' THEN
-            RETURN OLD;
-        END IF;
         RETURN NEW;
     END IF;
 
     RAISE EXCEPTION
         '% on history table % is not allowed', TG_OP, TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME
         USING ERRCODE  = 'insufficient_privilege',
-              DETAIL   = format('History is maintained automatically from %s and is append-only.',
+              DETAIL   = format('History is maintained automatically from %s and is insert-only.',
                                 COALESCE((SELECT v.main_table::text
                                             FROM temporal.versioned_table v
                                            WHERE v.history_table = TG_RELID::regclass),
@@ -61,7 +60,7 @@ $function$;
 
 COMMENT ON FUNCTION temporal.protect_history() IS
   'BEFORE INSERT/UPDATE/DELETE row trigger: rejects direct data manipulation of '
-  'a history table; only temporal.versioning() may write.';
+  'a history table; only temporal.versioning() may insert, nobody may update or delete.';
 
 
 CREATE OR REPLACE FUNCTION temporal.protect_history_truncate()
@@ -73,7 +72,7 @@ BEGIN
     RAISE EXCEPTION
         'TRUNCATE on history table % is not allowed', TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME
         USING ERRCODE = 'insufficient_privilege',
-              HINT    = 'History is append-only. Drop versioning first if you really mean to discard it.';
+              HINT    = 'History is insert-only. Drop versioning first if you really mean to discard it.';
 END;
 $function$;
 

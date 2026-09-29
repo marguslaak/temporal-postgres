@@ -20,6 +20,12 @@ CREATE TABLE IF NOT EXISTS temporal.versioned_table (
     main_table      regclass PRIMARY KEY,
     history_table   regclass NOT NULL UNIQUE,
     key_columns     text[]   NOT NULL,
+    begin_column    name     NOT NULL,
+    end_column      name     NOT NULL,
+    user_column     name,
+    delete_image    boolean  NOT NULL,
+    all_view        text     NOT NULL,   -- base UNION ALL history
+    as_of_function  text     NOT NULL,   -- signature, for DROP FUNCTION
     enabled_at      timestamptz NOT NULL DEFAULT now(),
     enabled_by      name        NOT NULL DEFAULT session_user
 );
@@ -28,9 +34,17 @@ COMMENT ON TABLE temporal.versioned_table IS
   'One row per table that has system versioning enabled via temporal.enable().';
 
 -- ----------------------------------------------------------------------------
+-- system-period-end of a row that is current, i.e. still in the base table.
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION temporal.end_of_time()
+RETURNS timestamptz
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+AS $$ SELECT '9999-12-30 00:00:00+00'::timestamptz $$;
+
+-- ----------------------------------------------------------------------------
 -- The name of the session variable that the versioning trigger flips on while
--- it writes to a history table. The guard trigger on the history table lets a
--- write through only while it is set. It is always set with is_local => true,
+-- it writes to a history table. The guard trigger on the history table lets an
+-- INSERT through only while it is set. It is always set with is_local => true,
 -- so it disappears at the end of the (sub)transaction, even on rollback.
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION temporal.write_flag_name()
@@ -54,6 +68,23 @@ AS $$
           AND a.attnum   = k.attnum
     WHERE  i.indrelid = p_table
       AND  i.indisprimary;
+$$;
+
+-- ----------------------------------------------------------------------------
+-- Column layout of a table: name and type of every live column, in order.
+-- The base and the history table must return exactly the same thing, which is
+-- what lets rows be copied positionally and the two be UNIONed.
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION temporal.column_layout(p_table regclass)
+RETURNS text[]
+LANGUAGE sql STABLE
+AS $$
+    SELECT array_agg(format('%I %s', a.attname, format_type(a.atttypid, a.atttypmod))
+                     ORDER BY a.attnum)
+    FROM   pg_attribute a
+    WHERE  a.attrelid = p_table
+      AND  a.attnum > 0
+      AND  NOT a.attisdropped;
 $$;
 
 -- ----------------------------------------------------------------------------
