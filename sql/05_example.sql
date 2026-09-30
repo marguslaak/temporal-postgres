@@ -10,23 +10,21 @@ CREATE TABLE IF NOT EXISTS employee (
     department        text,
     salary            numeric(12,2) NOT NULL CHECK (salary >= 0),
     hired_on          date   NOT NULL DEFAULT current_date,
-    -- populated by the versioning only; temporal.enable() would add the two
-    -- period columns itself if they were left out here
-    changed_by        name,
+    -- populated by the versioning only; temporal.enable() would add these
+    -- three columns itself if they were left out here
+    sys_changed_by    name,
     sys_period_begin  timestamptz NOT NULL,
     sys_period_end    timestamptz NOT NULL
 );
 
 -- Creates employee_history (same columns, PK (employee_id, sys_period_begin))
--- plus the triggers. changed_by records who made each version, and on DELETE
--- a second, zero-length image records who deleted the row.
+-- plus the triggers. sys_changed_by records who made each version, and on
+-- DELETE a second, zero-length image records who deleted the row.
 --
 -- Also creates the query helpers:
 --   employee_all                 view: employee UNION ALL employee_history
 --   employee_as_of(timestamptz)  the state of the table at any point in time
-SELECT temporal.enable('employee',
-                       p_user_column  => 'changed_by',
-                       p_delete_image => true);
+SELECT temporal.enable('employee');
 
 
 -- ---------------------------------------------------------------- how to read
@@ -40,10 +38,10 @@ SELECT temporal.enable('employee',
 --     which is
 --     SELECT * FROM employee_all
 --      WHERE sys_period_begin <= :ts AND sys_period_end > :ts;
---     (zero-length delete images never match)
+--     (delete images are zero-length, so they never match)
 --
 -- rows deleted since a time, and by whom :
---     SELECT changed_by, sys_period_end, *
+--     SELECT sys_changed_by AS deleted_by, sys_period_end AS deleted_at, *
 --       FROM employee_history
 --      WHERE sys_period_begin = sys_period_end AND sys_period_end >= :ts;
 -- ----------------------------------------------------------------------------

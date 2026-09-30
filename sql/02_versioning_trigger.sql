@@ -8,13 +8,13 @@
 --     CREATE TRIGGER <name>_period
 --         BEFORE INSERT OR UPDATE ON <base_table>
 --         FOR EACH ROW EXECUTE FUNCTION
---         temporal.stamp_period('<begin col>', '<end col>', '<user col or empty>');
+--         temporal.stamp_period('<begin col>', '<end col>', '<user col>');
 --
 --     CREATE TRIGGER <name>_versioning
 --         AFTER UPDATE OR DELETE ON <base_table>
 --         FOR EACH ROW EXECUTE FUNCTION
 --         temporal.versioning('<history_table>', '<begin col>', '<end col>',
---                             '<user col or empty>', '<delete image: true|false>');
+--                             '<user col>');
 --
 --     CREATE TRIGGER <name>_versioning_truncate
 --         BEFORE TRUNCATE ON <base_table>
@@ -30,9 +30,12 @@
 --             Nothing is written to the history.
 --     UPDATE  before-image -> history with end = now;
 --             the current row in base gets begin = the same now.
---     DELETE  before-image -> history with end = now.
---             Optionally a second image with begin = end = now, whose user
---             column records who deleted the row.
+--     DELETE  before-image -> history with end = now, plus a delete image:
+--             a copy with begin = end = now whose user column records who
+--             deleted the row. Being zero-length, it never matches as-of.
+--
+--   The user column is set to the acting role on every INSERT and UPDATE, so
+--   every version says who made it.
 --
 --   The history is only ever INSERTed into, never updated or deleted from.
 --   "The table as of T" is  begin <= T AND end > T  over base UNION ALL history.
@@ -76,7 +79,7 @@ AS $function$
 DECLARE
     v_begin_col text := TG_ARGV[0];
     v_end_col   text := TG_ARGV[1];
-    v_user_col  text := NULLIF(TG_ARGV[2], '');
+    v_user_col  text := TG_ARGV[2];
     v_now       timestamptz := clock_timestamp();
     v_begin     timestamptz;
     v_patch     jsonb;
@@ -89,10 +92,8 @@ BEGIN
     END IF;
 
     v_patch := jsonb_build_object(v_begin_col, v_now,
-                                  v_end_col,   temporal.end_of_time());
-    IF v_user_col IS NOT NULL THEN
-        v_patch := v_patch || jsonb_build_object(v_user_col, temporal.acting_role());
-    END IF;
+                                  v_end_col,   temporal.end_of_time(),
+                                  v_user_col,  temporal.acting_role());
 
     NEW := jsonb_populate_record(NEW, v_patch);
     RETURN NEW;
@@ -117,14 +118,13 @@ DECLARE
     v_history      regclass := TG_ARGV[0]::regclass;
     v_begin_col    text     := TG_ARGV[1];
     v_end_col      text     := TG_ARGV[2];
-    v_user_col     text     := NULLIF(TG_ARGV[3], '');
-    v_delete_image boolean  := TG_ARGV[4]::boolean;
+    v_user_col     text     := TG_ARGV[3];
     v_now          timestamptz;
     v_begin        timestamptz;
 BEGIN
-    IF TG_NARGS <> 5 THEN
+    IF TG_NARGS <> 4 THEN
         RAISE EXCEPTION
-            'temporal.versioning() on % needs 5 trigger arguments, got %',
+            'temporal.versioning() on % needs 4 trigger arguments, got %',
             TG_RELID::regclass, TG_NARGS
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
@@ -148,7 +148,9 @@ BEGIN
                                               ARRAY[v_end_col], ARRAY['$2']))
     USING OLD, v_now;
 
-    IF TG_OP = 'DELETE' AND v_delete_image THEN
+    -- Delete image: same row, begin = end = the delete time, stamped with
+    -- the role that deleted it.
+    IF TG_OP = 'DELETE' THEN
         EXECUTE format('INSERT INTO %s SELECT %s', v_history,
                        temporal.image_select_list(TG_RELID, '($1)',
                                                   ARRAY[v_begin_col, v_end_col, v_user_col],
@@ -181,8 +183,7 @@ DECLARE
     v_history      regclass := TG_ARGV[0]::regclass;
     v_begin_col    text     := TG_ARGV[1];
     v_end_col      text     := TG_ARGV[2];
-    v_user_col     text     := NULLIF(TG_ARGV[3], '');
-    v_delete_image boolean  := TG_ARGV[4]::boolean;
+    v_user_col     text     := TG_ARGV[3];
     v_now          timestamptz := clock_timestamp();
     v_end          text;
 BEGIN
@@ -195,14 +196,12 @@ BEGIN
                    TG_RELID::regclass)
     USING v_now;
 
-    IF v_delete_image THEN
-        EXECUTE format('INSERT INTO %s SELECT %s FROM %s AS t', v_history,
-                       temporal.image_select_list(TG_RELID, 't',
-                                                  ARRAY[v_begin_col, v_end_col, v_user_col],
-                                                  ARRAY[v_end, v_end, '$2']),
-                       TG_RELID::regclass)
-        USING v_now, temporal.acting_role();
-    END IF;
+    EXECUTE format('INSERT INTO %s SELECT %s FROM %s AS t', v_history,
+                   temporal.image_select_list(TG_RELID, 't',
+                                              ARRAY[v_begin_col, v_end_col, v_user_col],
+                                              ARRAY[v_end, v_end, '$2']),
+                   TG_RELID::regclass)
+    USING v_now, temporal.acting_role();
 
     PERFORM set_config(temporal.write_flag_name(), 'off', true);
 

@@ -2,16 +2,18 @@
 Some scripts and database triggers for PostgreSQL to add Temporal characteristics to database tables
 
 The base table and its history table have **exactly the same definition**,
-including the system period columns `sys_period_begin` / `sys_period_end`.
-Those two columns are populated only by the versioning. Because the tables
+including the system period columns `sys_period_begin` / `sys_period_end`
+and the user column `sys_changed_by`. Those three columns are populated only
+by the versioning: `sys_changed_by` is set to the acting role on every
+`INSERT` and `UPDATE`, so every version says who made it. Because the tables
 match, the history is created `LIKE` the base table, and the two can be
 `UNION ALL`-ed to query the full timeline.
 
 | Statement on the base table | Base table | History table |
 |---|---|---|
-| `INSERT` | new row, `begin = now`, `end = 9999-12-30 00:00:00` | nothing |
-| `UPDATE` | current row gets `begin = now` | before-image inserted with `end = now` |
-| `DELETE` | row removed | before-image inserted with `end = now`; optionally a second image with `begin = end = now` |
+| `INSERT` | new row, `begin = now`, `end = 9999-12-30 00:00:00`, `sys_changed_by = user` | nothing |
+| `UPDATE` | current row gets `begin = now`, `sys_changed_by = user` | before-image inserted with `end = now` |
+| `DELETE` | row removed | before-image inserted with `end = now`, **plus a delete image**: a copy with `begin = end = now` and `sys_changed_by` = the user who deleted it |
 | `TRUNCATE` | all rows removed | every row versioned as if deleted |
 
 Rows are only ever **inserted** into the history, never updated or deleted, so
@@ -41,12 +43,10 @@ psql -v ON_ERROR_STOP=1 -f sql/06_test.sql           # optional: self-checking t
 ## Use
 
 ```sql
-SELECT temporal.enable('employee');            -- adds the period columns if missing,
+SELECT temporal.enable('employee');            -- adds the period and user columns if missing,
                                                -- creates employee_history + triggers,
                                                -- employee_all and employee_as_of()
-SELECT temporal.enable('employee',
-                       p_user_column  => 'changed_by',  -- set to the acting role on every change
-                       p_delete_image => true);         -- record who deleted a row
+SELECT temporal.enable('employee', p_user_column => 'changed_by');  -- your own user column
 SELECT temporal.enable('employee', 'employee_audit', 'archive');  -- custom name/schema
 SELECT temporal.disable('employee');           -- detach; add true to drop the history
 ```
@@ -54,7 +54,9 @@ SELECT temporal.disable('employee');           -- detach; add true to drop the h
 The base table needs a primary key: it is what identifies "the same row"
 across time. If the period columns are missing, `enable()` adds them and gives
 existing rows `begin = now()`. If they already exist, they must be
-`timestamptz`. Enabling writes nothing to the history.
+`timestamptz`. A missing user column is added as `name`; existing rows get
+`NULL` there, because who made them is not known. Enabling writes nothing to
+the history.
 
 `enable()` also creates two query helpers next to the base table:
 
@@ -95,13 +97,17 @@ SELECT * FROM employee_all
  WHERE sys_period_begin <= '2026-01-01 12:00+02'
    AND sys_period_end   >  '2026-01-01 12:00+02';
 
--- what was deleted, and by whom (needs p_delete_image and p_user_column)
-SELECT changed_by, sys_period_end, * FROM employee_history
+-- what was deleted, when, and by whom
+SELECT sys_changed_by AS deleted_by, sys_period_end AS deleted_at, *
+  FROM employee_history
  WHERE sys_period_begin = sys_period_end;
 ```
 
-The zero-length delete image never matches an as-of query. It exists only to
-record who deleted the row, in the user column.
+Every `DELETE` leaves two rows in the history. The before-image keeps who last
+changed the row. The delete image has the same values but `begin = end` = the
+delete time, and `sys_changed_by` = who deleted it. Because it is zero-length,
+it never matches an as-of query; it exists only to preserve who deleted the
+row.
 
 ## How the guard lets the trigger through
 

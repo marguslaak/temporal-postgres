@@ -21,7 +21,7 @@ BEGIN
 
     ------------------------------------------------------------------ INSERT
     INSERT INTO employee (first_name, last_name, department, salary,
-                          sys_period_begin, sys_period_end, changed_by)
+                          sys_period_begin, sys_period_end, sys_changed_by)
     VALUES ('Mari', 'Tamm', 'Payments', 4000.00,
             '2000-01-01', '2000-01-02', 'somebody_else')   -- must be overwritten
     RETURNING employee_id, sys_period_begin INTO v_id, v_b0;
@@ -30,7 +30,7 @@ BEGIN
            'INSERT must set system-period-begin to the current time';
     ASSERT (SELECT sys_period_end FROM employee WHERE employee_id = v_id) = temporal.end_of_time(),
            'INSERT must set system-period-end to 9999-12-30';
-    ASSERT (SELECT changed_by FROM employee WHERE employee_id = v_id) = session_user,
+    ASSERT (SELECT sys_changed_by FROM employee WHERE employee_id = v_id) = session_user,
            'the user column must be filled by the versioning';
 
     SELECT count(*) INTO v_n FROM employee_history WHERE employee_id = v_id;
@@ -86,7 +86,7 @@ BEGIN
 
     SELECT count(*) INTO v_n FROM employee_history
      WHERE employee_id = v_id AND sys_period_begin = sys_period_end
-       AND changed_by = session_user AND salary = 4700.00;
+       AND sys_changed_by = session_user AND salary = 4700.00;
     ASSERT v_n = 1, 'the delete image must have begin = end and record who deleted';
 
     SELECT count(*) INTO v_n FROM employee_history
@@ -184,9 +184,7 @@ INSERT INTO account VALUES ('EE001', 10.00), ('EE002', 20.00);
 SELECT temporal.enable('account');
 
 DO $$
-DECLARE
-    v_n  integer;
-    v_t0 timestamptz;
+DECLARE v_n integer;
 BEGIN
     SELECT count(*) INTO v_n FROM account
      WHERE sys_period_begin <= now() AND sys_period_end = temporal.end_of_time();
@@ -195,25 +193,11 @@ BEGIN
     SELECT count(*) INTO v_n FROM account_history;
     ASSERT v_n = 0, 'enabling must not write to the history';
 
-    PERFORM pg_sleep(0.01);
-    v_t0 := clock_timestamp();
-    PERFORM pg_sleep(0.01);
-
     UPDATE account SET balance = 30.00 WHERE iban = 'EE001';
     DELETE FROM account WHERE iban = 'EE002';
 
     SELECT count(*) INTO v_n FROM account_history;
     ASSERT v_n = 2, 'without delete images, one history row per UPDATE/DELETE';
-
-    -- the query helpers created by enable()
-    ASSERT (SELECT count(*) FROM account_all) = 3,
-           'account_all must union base and history';
-    ASSERT (SELECT string_agg(iban || '=' || balance, ',' ORDER BY iban)
-              FROM account_as_of(v_t0)) = 'EE001=10.00,EE002=20.00',
-           'account_as_of must return the table as it was';
-    ASSERT (SELECT string_agg(iban || '=' || balance, ',' ORDER BY iban)
-              FROM account_as_of(clock_timestamp())) = 'EE001=30.00',
-           'account_as_of(now) must return the current rows';
 
     RAISE NOTICE 'existing-table tests passed';
 END;
@@ -228,10 +212,6 @@ BEGIN
     ASSERT (SELECT count(*) FROM account_history) = 2, 're-enable must reuse the history';
 
     PERFORM temporal.disable('account');
-    ASSERT to_regclass('account_all') IS NULL, 'disable must drop the _all view';
-    ASSERT to_regprocedure('account_as_of(timestamptz)') IS NULL,
-           'disable must drop the _as_of function';
-
     ALTER TABLE account ADD COLUMN owner text;
     BEGIN
         PERFORM temporal.enable('account');

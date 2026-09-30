@@ -22,8 +22,7 @@ CREATE TABLE IF NOT EXISTS temporal.versioned_table (
     key_columns     text[]   NOT NULL,
     begin_column    name     NOT NULL,
     end_column      name     NOT NULL,
-    user_column     name,
-    delete_image    boolean  NOT NULL,
+    user_column     name     NOT NULL,
     all_view        text     NOT NULL,   -- base UNION ALL history
     as_of_function  text     NOT NULL,   -- signature, for DROP FUNCTION
     enabled_at      timestamptz NOT NULL DEFAULT now(),

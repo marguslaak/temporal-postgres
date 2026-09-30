@@ -14,8 +14,7 @@ CREATE OR REPLACE FUNCTION temporal.enable(
     p_history_schema text     DEFAULT NULL,   -- default: schema of p_table
     p_begin_column   name     DEFAULT 'sys_period_begin',
     p_end_column     name     DEFAULT 'sys_period_end',
-    p_user_column    name     DEFAULT NULL,   -- filled with the acting role on every change
-    p_delete_image   boolean  DEFAULT false   -- on DELETE, also record a begin = end image
+    p_user_column    name     DEFAULT 'sys_changed_by'  -- who made each version / deleted the row
 )
 RETURNS regclass
 LANGUAGE plpgsql
@@ -52,8 +51,9 @@ BEGIN
             USING ERRCODE = 'invalid_table_definition';
     END IF;
 
-    IF p_begin_column = ANY (v_key) OR p_end_column = ANY (v_key) THEN
-        RAISE EXCEPTION 'the system period columns of % may not be part of its primary key', p_table
+    IF p_begin_column = ANY (v_key) OR p_end_column = ANY (v_key)
+       OR p_user_column = ANY (v_key) THEN
+        RAISE EXCEPTION 'the system period and user columns of % may not be part of its primary key', p_table
             USING ERRCODE = 'invalid_table_definition';
     END IF;
 
@@ -62,12 +62,13 @@ BEGIN
             USING ERRCODE = 'duplicate_object';
     END IF;
 
-    IF p_user_column IS NOT NULL AND NOT EXISTS (
+    -- ------------------------------------------------------------ user column
+    -- Added if missing. Existing rows get NULL: who made them is not known.
+    IF NOT EXISTS (
            SELECT 1 FROM pg_attribute
             WHERE attrelid = p_table AND attname = p_user_column
               AND attnum > 0 AND NOT attisdropped) THEN
-        RAISE EXCEPTION 'user column % does not exist in %', p_user_column, p_table
-            USING ERRCODE = 'undefined_column';
+        EXECUTE format('ALTER TABLE %s ADD COLUMN %I name', p_table, p_user_column);
     END IF;
 
     -- ------------------------------------------------------- system period
@@ -148,10 +149,9 @@ BEGIN
     -- ------------------------------------------------------------- triggers 1
     -- stamp the period on the base table, write before-images to the history
     v_prefix := left(v_name, 40);
-    v_args   := format('%L, %L, %L, %L, %L',
+    v_args   := format('%L, %L, %L, %L',
                        format('%I.%I', v_hschema, v_hname),
-                       p_begin_column, p_end_column,
-                       COALESCE(p_user_column, ''), p_delete_image);
+                       p_begin_column, p_end_column, p_user_column);
 
     EXECUTE format(
         'CREATE TRIGGER %I
@@ -159,7 +159,7 @@ BEGIN
              FOR EACH ROW
              EXECUTE FUNCTION temporal.stamp_period(%L, %L, %L)',
         v_prefix || '_period', p_table,
-        p_begin_column, p_end_column, COALESCE(p_user_column, ''));
+        p_begin_column, p_end_column, p_user_column);
 
     EXECUTE format(
         'CREATE TRIGGER %I
@@ -228,18 +228,18 @@ BEGIN
 
     INSERT INTO temporal.versioned_table
            (main_table, history_table, key_columns,
-            begin_column, end_column, user_column, delete_image,
+            begin_column, end_column, user_column,
             all_view, as_of_function)
     VALUES (p_table, v_hist, v_key,
-            p_begin_column, p_end_column, p_user_column, p_delete_image,
+            p_begin_column, p_end_column, p_user_column,
             v_view, v_as_of || '(timestamptz)');
 
     RETURN v_hist;
 END;
 $function$;
 
-COMMENT ON FUNCTION temporal.enable(regclass, text, text, name, name, name, boolean) IS
-  'Adds the system period to a table, creates <table>_history with the same '
+COMMENT ON FUNCTION temporal.enable(regclass, text, text, name, name, name) IS
+  'Adds the system period and user column to a table, creates <table>_history with the same '
   'columns and attaches the triggers: the ones that maintain the period and '
   'insert before-images into the history on UPDATE/DELETE, and the ones that '
   'keep the history insert-only. Also creates the <table>_all view and the '
